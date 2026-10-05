@@ -59,6 +59,7 @@ CTrade   g_trade;
 string   g_sym;
 datetime g_lastBar   = 0;   // open time of last processed M5 bar (server time)
 long     g_rangeDay  = -1;  // UTC day number the stored range belongs to
+long     g_skipDay   = -1;  // UTC day whose breakout signal was skipped (no later re-entry)
 double   g_asHigh    = 0;
 double   g_asLow     = 0;
 
@@ -264,8 +265,9 @@ void OnTick()
    if(!buy && !sell)
       return;
 
-   if(!CanOpen(dayUTC))
+   if(!CanOpen(dayUTC) || g_skipDay == (long)(dayUTC / 86400))
       return;
+   g_skipDay = (long)(dayUTC / 86400); // a signal that cannot be traded uses up the day; reset below on success
 
    //--- prices
    MqlTick tk;
@@ -309,6 +311,8 @@ void OnTick()
 
    bool ok = buy ? g_trade.Buy(lots, g_sym, entry, sl, tp, "ALB buy")
                  : g_trade.Sell(lots, g_sym, entry, sl, tp, "ALB sell");
+   if(ok && g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+      g_skipDay = -1;
    if(!ok || g_trade.ResultRetcode() != TRADE_RETCODE_DONE)
       Print("Order failed: ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
    else
