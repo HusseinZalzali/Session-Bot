@@ -161,14 +161,10 @@ bool EnsureRange(datetime dayUTC)
   }
 
 //+------------------------------------------------------------------+
-//| Trades already opened today (UTC) + any position still open      |
+//| Entries already opened today (UTC) by this EA                    |
 //+------------------------------------------------------------------+
 bool CanOpen(datetime dayUTC)
   {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-      if(PositionGetSymbol(i) == g_sym && PositionGetInteger(POSITION_MAGIC) == (long)InpMagic)
-         return false;
-
    if(!HistorySelect(ToServer(dayUTC), TimeCurrent() + 60))
       return false;
    int cnt = 0;
@@ -335,6 +331,15 @@ double OnTester()
       long e = HistoryDealGetInteger(d, DEAL_ENTRY);
       if(e == DEAL_ENTRY_OUT || e == DEAL_ENTRY_OUT_BY)
          tr[k].closeT = (datetime)HistoryDealGetInteger(d, DEAL_TIME);
+     }
+
+   //--- order by close time (positions can overlap across days)
+   for(int i = 1; i < nt; i++)
+     {
+      TradeRec x = tr[i];
+      int j = i - 1;
+      while(j >= 0 && tr[j].closeT > x.closeT) { tr[j + 1] = tr[j]; j--; }
+      tr[j + 1] = x;
      }
 
    //--- statistics
