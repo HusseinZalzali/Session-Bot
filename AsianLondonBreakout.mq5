@@ -15,6 +15,13 @@ enum ENUM_SL_METHOD
    SL_FIXED_POINTS   = 2  // Fixed distance (points)
   };
 
+//--- Position sizing
+enum ENUM_LOT_MODE
+  {
+   LOT_RISK_PERCENT = 0, // Risk % of balance per trade
+   LOT_FIXED        = 1  // Fixed lot size
+  };
+
 //--- How broker server time relates to UTC
 enum ENUM_SERVER_TZ
   {
@@ -35,7 +42,9 @@ input int            InpServerUTCOffset = 2;    // Server UTC offset in hours (F
 
 input group "Trade"
 input string         InpSymbol          = "";   // Symbol ("" = chart symbol)
-input double         InpLots            = 0.01; // Lot size (fixed)
+input ENUM_LOT_MODE  InpLotMode         = LOT_RISK_PERCENT; // Lot sizing mode
+input double         InpRiskPercent     = 1.0;  // Risk % of balance per trade (Risk % mode)
+input double         InpLots            = 0.01; // Lot size (Fixed mode)
 input ENUM_SL_METHOD InpSLMethod        = SL_OPPOSITE_RANGE; // SL method
 input int            InpSLPoints        = 3000; // SL distance in points (Fixed method only)
 input double         InpRR              = 2.0;  // Reward:Risk (TP = RR x SL distance)
@@ -119,10 +128,12 @@ int OnInit()
      }
    double vmin = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN);
    double vmax = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MAX);
-   if(InpRR <= 0 || InpMaxTradesPerDay < 1 || InpLots < vmin || InpLots > vmax ||
+   if(InpRR <= 0 || InpMaxTradesPerDay < 1 ||
+      (InpLotMode == LOT_FIXED && (InpLots < vmin || InpLots > vmax)) ||
+      (InpLotMode == LOT_RISK_PERCENT && (InpRiskPercent <= 0 || InpRiskPercent > 100)) ||
       (InpSLMethod == SL_FIXED_POINTS && InpSLPoints <= 0))
      {
-      Print("Invalid RR / lots / max trades / SL points. Lot min=", vmin, " max=", vmax);
+      Print("Invalid RR / lots / risk % / max trades / SL points. Lot min=", vmin, " max=", vmax);
       return INIT_PARAMETERS_INCORRECT;
      }
    g_trade.SetExpertMagicNumber(InpMagic);
@@ -177,6 +188,48 @@ bool CanOpen(datetime dayUTC)
          cnt++;
      }
    return cnt < InpMaxTradesPerDay;
+  }
+
+//+------------------------------------------------------------------+
+//| Lot size. Risk % mode: lot so that a stop-out loses RiskPercent   |
+//| of current balance (spread included). Returns 0 = skip trade.     |
+//+------------------------------------------------------------------+
+double CalcLots(bool buy, double entry, double sl)
+  {
+   if(InpLotMode == LOT_FIXED)
+      return InpLots;
+
+   double lossPerLot = 0;
+   if(!OrderCalcProfit(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, g_sym, 1.0, entry, sl, lossPerLot) || lossPerLot >= 0)
+      return 0;
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * InpRiskPercent / 100.0;
+   double step = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_STEP);
+   double vmin = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN);
+   double vmax = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MAX);
+   double lots = MathFloor(riskMoney / -lossPerLot / step + 1e-9) * step; // round DOWN: never exceed risk
+   if(lots < vmin)
+     {
+      Print("Skip: risk ", DoubleToString(riskMoney, 2), " too small for min lot with SL distance ",
+            DoubleToString(MathAbs(entry - sl), _Digits));
+      return 0;
+     }
+   lots = MathMin(lots, vmax);
+
+   //--- reduce if free margin is insufficient
+   double marginPerLot = 0;
+   if(OrderCalcMargin(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, g_sym, 1.0, entry, marginPerLot) && marginPerLot > 0)
+     {
+      double maxByMargin = MathFloor(AccountInfoDouble(ACCOUNT_MARGIN_FREE) * 0.95 / marginPerLot / step) * step;
+      if(lots > maxByMargin)
+        {
+         Print("Lot reduced by free margin: ", DoubleToString(lots, 2), " -> ", DoubleToString(maxByMargin, 2));
+         lots = maxByMargin;
+        }
+      if(lots < vmin)
+         return 0;
+     }
+   int volDigits = (int)MathMax(0, MathCeil(-MathLog10(step) - 1e-9));
+   return NormalizeDouble(lots, volDigits);
   }
 
 //+------------------------------------------------------------------+
@@ -250,15 +303,19 @@ void OnTick()
         }
      }
 
-   bool ok = buy ? g_trade.Buy(InpLots, g_sym, entry, sl, tp, "ALB buy")
-                 : g_trade.Sell(InpLots, g_sym, entry, sl, tp, "ALB sell");
+   double lots = CalcLots(buy, entry, sl);
+   if(lots <= 0)
+      return;
+
+   bool ok = buy ? g_trade.Buy(lots, g_sym, entry, sl, tp, "ALB buy")
+                 : g_trade.Sell(lots, g_sym, entry, sl, tp, "ALB sell");
    if(!ok || g_trade.ResultRetcode() != TRADE_RETCODE_DONE)
       Print("Order failed: ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
    else
       Print(buy ? "BUY " : "SELL ", TimeToString(TimeCurrent()),
             " | AsianH=", DoubleToString(g_asHigh, digits), " AsianL=", DoubleToString(g_asLow, digits),
             " | entry=", DoubleToString(entry, digits), " SL=", DoubleToString(sl, digits),
-            " TP=", DoubleToString(tp, digits));
+            " TP=", DoubleToString(tp, digits), " lots=", DoubleToString(lots, 2));
   }
 
 //+------------------------------------------------------------------+
@@ -402,7 +459,8 @@ double OnTester()
 
    Out("===== AsianLondonBreakout report =====");
    Out("Symbol," + g_sym);
-   Out("Lots," + DoubleToString(InpLots, 2) + ",RR," + D2(InpRR) + ",SL method," + EnumToString(InpSLMethod));
+   Out("Lot mode," + EnumToString(InpLotMode) + ",Risk %," + D2(InpRiskPercent) + ",Fixed lots," + DoubleToString(InpLots, 2));
+   Out("RR," + D2(InpRR) + ",SL method," + EnumToString(InpSLMethod));
    Out("Extra commission per lot (report only)," + D2(InpExtraCommission));
    Out("Total trades," + IntegerToString(closed));
    Out("Winning trades," + IntegerToString(wins));
